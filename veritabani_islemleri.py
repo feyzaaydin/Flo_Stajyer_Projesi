@@ -62,6 +62,47 @@ def durum_guncelle(basvuru_id, yeni_durum):
     conn.close()
 
 
+# Admin panelindeki tabloda elle düzenlenebilen sütunların ekrandaki adı -> veritabanı kolonu
+DUZENLENEBILIR_KOLONLAR = {
+    "Ad Soyad": "ad_soyad",
+    "E-posta": "eposta",
+    "Telefon": "telefon",
+    "Bölüm": "bolum",
+    "Eğitim": "egitim_seviyesi",
+    "Lise": "lise_adi",
+    "Sınıf": "sinif",
+    "Önerilen Departman": "en_uygun_departman",
+    "Önerilen Proje": "en_uygun_proje",
+    "Uyum Puanı (%)": "uyum_puani",
+    "CV Tutarlılık Notu": "cv_tutarlilik_notu",
+    "Durum": "durum",
+}
+
+
+def basvuru_guncelle(basvuru_id, alan_degerleri):
+    """alan_degerleri: {veritabani_kolonu: yeni_deger} sözlüğü. Sadece izin verilen
+    kolonlar güncellenir (SQL enjeksiyonuna karşı kolon adı beyaz listeden kontrol edilir)."""
+    izinli = set(DUZENLENEBILIR_KOLONLAR.values())
+    guncellenecek = {k: v for k, v in alan_degerleri.items() if k in izinli}
+    if not guncellenecek:
+        return
+    conn = sqlite3.connect('flo_stajyer.db')
+    c = conn.cursor()
+    set_ifadesi = ", ".join(f"{kolon} = ?" for kolon in guncellenecek)
+    degerler = list(guncellenecek.values()) + [int(basvuru_id)]
+    c.execute(f"UPDATE stajyerler SET {set_ifadesi} WHERE id = ?", degerler)
+    conn.commit()
+    conn.close()
+
+
+def basvuru_sil(basvuru_id):
+    conn = sqlite3.connect('flo_stajyer.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM stajyerler WHERE id = ?", (int(basvuru_id),))
+    conn.commit()
+    conn.close()
+
+
 def gecmis_basvurulari_getir():
     conn = sqlite3.connect('flo_stajyer.db')
     df = pd.read_sql_query('''
