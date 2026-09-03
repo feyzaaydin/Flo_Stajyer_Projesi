@@ -73,7 +73,8 @@ def veritabani_olustur():
         "cv_tutarlilik_notu": "TEXT",
         "eposta": "TEXT",
         "telefon": "TEXT",
-        "durum": "TEXT"
+        "durum": "TEXT",
+        "lise_adi": "TEXT"
     }
 
     for kolon, tip in eklenecek_kolonlar.items():

@@ -22,7 +22,8 @@ def semayi_kontrol_et_ve_onar():
             "cv_tutarlilik_notu": "TEXT",
             "eposta": "TEXT",
             "telefon": "TEXT",
-            "durum": "TEXT"
+            "durum": "TEXT",
+            "lise_adi": "TEXT"
         }
         for kolon, tip in eklenecek_kolonlar.items():
             if kolon not in mevcut_kolonlar:
@@ -34,7 +35,8 @@ def semayi_kontrol_et_ve_onar():
 
 def basvuru_kaydet(ad_soyad, egitim_seviyesi, sinif, bolum, yetkinlikler_listesi, staj_gunu,
                     en_uygun_departman, en_uygun_proje, uyum_puani,
-                    eposta="", telefon="", dogrulanmamis_yetkinlikler=None, cv_tutarlilik_notu=""):
+                    eposta="", telefon="", dogrulanmamis_yetkinlikler=None, cv_tutarlilik_notu="",
+                    lise_adi=""):
     conn = sqlite3.connect('flo_stajyer.db')
     c = conn.cursor()
     tarih = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -43,11 +45,11 @@ def basvuru_kaydet(ad_soyad, egitim_seviyesi, sinif, bolum, yetkinlikler_listesi
         INSERT INTO stajyerler
             (ad_soyad, egitim_seviyesi, sinif, bolum, yetkinlikler, staj_gunu,
              en_uygun_departman, en_uygun_proje, uyum_puani, basvuru_tarihi,
-             dogrulanmamis_yetkinlikler, cv_tutarlilik_notu, eposta, telefon, durum)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             dogrulanmamis_yetkinlikler, cv_tutarlilik_notu, eposta, telefon, durum, lise_adi)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (ad_soyad, egitim_seviyesi, sinif, bolum, ", ".join(yetkinlikler_listesi), staj_gunu,
           en_uygun_departman, en_uygun_proje, uyum_puani, tarih,
-          dogrulanmamis_str, cv_tutarlilik_notu, eposta, telefon, "Beklemede"))
+          dogrulanmamis_str, cv_tutarlilik_notu, eposta, telefon, "Beklemede", lise_adi))
     conn.commit()
     conn.close()
 
@@ -64,7 +66,7 @@ def gecmis_basvurulari_getir():
     conn = sqlite3.connect('flo_stajyer.db')
     df = pd.read_sql_query('''
         SELECT id AS "ID", ad_soyad AS "Ad Soyad", eposta AS "E-posta", telefon AS "Telefon",
-               bolum AS "Bölüm", egitim_seviyesi AS "Eğitim",
+               bolum AS "Bölüm", egitim_seviyesi AS "Eğitim", lise_adi AS "Lise",
                sinif AS "Sınıf", en_uygun_departman AS "Önerilen Departman",
                en_uygun_proje AS "Önerilen Proje", uyum_puani AS "Uyum Puanı (%)",
                cv_tutarlilik_notu AS "CV Tutarlılık Notu", durum AS "Durum",

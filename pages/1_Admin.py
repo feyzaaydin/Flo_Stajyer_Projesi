@@ -3,8 +3,6 @@ from veritabani_islemleri import semayi_kontrol_et_ve_onar, gecmis_basvurulari_g
 
 semayi_kontrol_et_ve_onar()
 
-st.set_page_config(page_title="FLO Kariyer - Admin", layout="wide")
-
 st.title("🔒 Admin Paneli")
 st.caption("Bu sayfa sadece yetkili ekip üyeleri içindir. Stajyer başvurularının kişisel bilgilerini içerir.")
 
