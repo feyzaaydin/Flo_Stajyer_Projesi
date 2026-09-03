@@ -112,9 +112,20 @@ def cv_analiz_ve_dogrulama_yap(cv_metni, yetkinlikler, form_ad_soyad, form_bolum
     Üniversite: {form_universite}
     Bölüm: {form_bolum}
     Sınıf/Eğitim Seviyesi: {form_sinif}
-    CV'de yer alan ad soyad, üniversite, bölüm ve sınıf/mezuniyet bilgisinin, formda girilen
-    bilgilerle tutarlı olup olmadığını değerlendir. CV'de bu bilgilerden biri hiç geçmiyorsa
-    bunu bir uyumsuzluk sayma, sadece gerçekten çelişen bir bilgi varsa belirt.
+
+    ÖNEMLİ: Aşağıdaki CV metni bir PDF'ten otomatik çıkarıldı. Çok sütunlu/tasarımlı CV
+    şablonlarında metin çıkarma sırası bozulabilir; kelimeler birbirine yapışabilir
+    (örn. bir e-posta adresiyle ad soyad boşluksuz birleşmiş olabilir: "ornek@mail.comAHMET YILMAZ"
+    gibi). Bu yüzden metni satır satır değil, BÜTÜN OLARAK dikkatlice tara ve içinde geçen
+    olası bir kişi adını (büyük harfli art arda gelen kelimeler, e-postayla veya başka
+    kelimelerle bitişik yazılmış olsa bile) tespit etmeye çalış.
+
+    CV'de bulduğun ad soyad, üniversite, bölüm ve sınıf/mezuniyet bilgisinin, formda girilen
+    bilgilerle tutarlı olup olmadığını değerlendir. Özellikle AD SOYAD'ı dikkatlice kontrol et:
+    CV metninde formdakinden AÇIKÇA FARKLI bir kişi adı buluyorsan (tamamen başka bir isim,
+    anlamsız bir karakter dizisi vb.), bunu MUTLAKA HAYIR olarak işaretle — temkinli davranıp
+    EVET deme. CV'de bu bilgilerden biri (üniversite/bölüm/sınıf) hiç geçmiyorsa sadece o alan
+    için bunu bir uyumsuzluk sayma.
 
     CV Metni:
     \"\"\"{cv_metni[:4000]}\"\"\"
