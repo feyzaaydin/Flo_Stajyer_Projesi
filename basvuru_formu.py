@@ -1,20 +1,20 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
 import PyPDF2
 from google import genai
 import plotly.express as px
 import io
 import time
-import datetime
 import re
+import json
+import difflib
 
 from okullar import universiteler_listesi
 from bolumler import bolumler_listesi
 from liseler import liseler_listesi
 from database import FLO_DEPARTMANLARI
 from veritabani_islemleri import semayi_kontrol_et_ve_onar, basvuru_kaydet
-from eposta_gonder import haftalik_program_olustur, staj_programi_eposta_gonder
+from eposta_gonder import haftalik_program_olustur, staj_programi_eposta_gonder, GEMINI_MODEL
 
 semayi_kontrol_et_ve_onar()
 
@@ -24,11 +24,45 @@ st.sidebar.header("⚙️ Sistem.")
 # API anahtarını önce güvenli sistem ayarlarından (.streamlit/secrets.toml) okumayı dene.
 # Orada tanımlıysa kullanıcı her seferinde elle girmek zorunda kalmaz.
 try:
-    api_key = st.secrets["GEMINI_API_KEY"]
-    st.sidebar.success("✅ API anahtarı sistemde kayıtlı, tekrar girmenize gerek yok.")
+    secrets_api_key = str(st.secrets["GEMINI_API_KEY"]).strip()
 except Exception:
-    api_key = st.sidebar.text_input("Gemini API Anahtarı Girin", type="password")
-    st.sidebar.info("Yapay zeka analizinin çalışması için Google AI Studio'dan alınmış bir API anahtarı gereklidir.")
+    secrets_api_key = ""
+
+
+def _gecerli_anahtar_gorunumu(deger):
+    """Google AI Studio API anahtarları 'AIza' ile başlar. 'AQ.' ile başlayan değer
+    geçici bir OAuth oturum jetonudur ve generateContent çağrılarında 401 verir."""
+    return bool(deger) and deger.startswith("AIza")
+
+
+if _gecerli_anahtar_gorunumu(secrets_api_key):
+    # Sistemde geçerli görünen bir anahtar var; kullanıcıya sormaya gerek yok.
+    api_key = secrets_api_key
+    st.sidebar.success("✅ API anahtarı sistemde kayıtlı, tekrar girmenize gerek yok.")
+else:
+    # Sistemdeki anahtar yok ya da geçersiz görünüyor: elle girme alanını aç.
+    if secrets_api_key:
+        st.sidebar.warning(
+            "⚠️ secrets.toml içindeki GEMINI_API_KEY bir Google AI Studio API anahtarına "
+            "benzemiyor ('AIza...' ile başlamalı). Geçerli bir anahtarı aşağıya "
+            "yapıştırabilirsiniz; bu oturum için onu kullanır."
+        )
+    elle_girilen = st.sidebar.text_input(
+        "Gemini API Anahtarı Girin (AIza...)", type="password"
+    ).strip()
+    api_key = elle_girilen or secrets_api_key
+    st.sidebar.info(
+        "Yapay zeka özellikleri için Google AI Studio'dan alınmış bir API anahtarı gerekir: "
+        "https://aistudio.google.com/apikey"
+    )
+
+# Elle girilen anahtar da 'AIza' ile başlamıyorsa kullanıcıyı uyar (ama engelleme).
+if api_key and not _gecerli_anahtar_gorunumu(api_key):
+    st.sidebar.warning(
+        "⚠️ Girilen değer 'AIza...' ile başlamıyor. 'AQ.' ile başlayan değerler "
+        "geçici oturum jetonudur ve çalışmaz. Google Cloud Console > API'ler ve Hizmetler "
+        "> Kimlik Bilgileri > API anahtarı oluştur adımıyla da kalıcı bir anahtar alabilirsiniz."
+    )
 
 # SMTP (e-posta) ayarları: stajyere çalışma programını göndermek için kullanılır.
 # .streamlit/secrets.toml içinde tanımlı değilse e-posta adımı sessizce atlanır.
@@ -153,90 +187,115 @@ def cv_analiz_ve_dogrulama_yap(
     form_sinif,
     key
 ):
-    client = genai.Client(api_key=key)
+    """CV'yi DERİNLEMESİNE analiz eder ve form bilgileriyle tutarlılığını kontrol eder.
 
-    prompt = f"""
-Sen SIFIR TOLERANSLI bir CV doğrulama uzmanısın.
+    Dönüş: (yetkinlikler, tutarlilik_notu, cv_profili)
+    cv_profili, projelerin sıfırdan üretilebilmesi için gereken zengin bilgiyi taşır:
+    eğitim, teknik beceriler, programlama dilleri, teknolojiler, deneyimler,
+    kişisel projeler, ilgi alanları, sektör deneyimi ve genel seviye.
+    """
+    bos_profil = {
+        "egitim": "", "teknik_beceriler": [], "programlama_dilleri": [],
+        "teknolojiler": [], "deneyimler": [], "projeler": [],
+        "ilgi_alanlari": [], "sektor_deneyimi": [], "seviye": "",
+    }
 
-GÖREV 1 - YETKİNLİK ANALİZİ:
-Sadece şu havuzdan eşleşen yetkinlikleri bul:
+    prompt = f"""Sen SIFIR TOLERANSLI bir CV analiz ve doğrulama uzmanısın. İki görevin var.
+
+GÖREV 1 - DERİN CV ANALİZİ:
+CV'den şu bilgileri ÇIKAR (CV'de yoksa boş bırak, ASLA uydurma):
+- egitim: bölüm ve okul bilgisi (tek cümle)
+- teknik_beceriler: CV'de geçen teknik beceriler
+- programlama_dilleri: CV'de geçen programlama dilleri
+- teknolojiler: framework, kütüphane, araç, veritabanı, platform adları
+- deneyimler: staj/iş deneyimleri ("Pozisyon - Şirket - süre" biçiminde kısa)
+- projeler: CV'de anlatılan kişisel/okul projeleri (kısa başlık)
+- ilgi_alanlari: adayın ilgi duyduğu alanlar
+- sektor_deneyimi: varsa çalıştığı sektörler
+- seviye: adayın genel yetkinlik seviyesi. SADECE şunlardan biri: "Başlangıç", "Orta", "İleri"
+
+Ayrıca şu havuzdan eşleşen yetkinlikleri seç (SADECE bu havuzdaki kelimeler):
 {', '.join(yetkinlikler)}
 
 GÖREV 2 - BİLGİ TUTARLILIK KONTROLÜ:
-
-Adayın başvuru formuna girdiği bilgiler:
-
+Adayın forma girdiği bilgiler:
 Ad Soyad: {form_ad_soyad}
 Üniversite: {form_universite}
 Bölüm: {form_bolum}
+Sınıf: {form_sinif}
 
-CV'deki bilgilerle formdaki bilgileri karşılaştır.
-
-Eğer:
-- Ad soyad açıkça farklıysa,
-- Üniversite açıkça farklıysa,
-- Bölüm açıkça farklıysa,
-
-TUTARLI: HAYIR yaz.
-
-Eğer bilgiler birbiriyle uyumluysa:
-
-TUTARLI: EVET yaz.
-
-Kesinlikle tahmin yapma.
+CV'deki bilgilerle formdaki bilgileri karşılaştır. Ad soyad, üniversite veya bölüm
+AÇIKÇA farklıysa tutarli=false yaz ve hangi bilginin uyuşmadığını aciklama'ya yaz.
+Uyumluysa tutarli=true, aciklama boş. Kesinlikle tahmin yapma.
 
 CV Metni:
 \"\"\"
-{cv_metni[:4000]}
+{cv_metni[:6000]}
 \"\"\"
 
-Cevabını TAM OLARAK şu formatta ver:
-
-YETKINLIKLER: <eşleşen yetkinlikleri virgülle yaz>
-TUTARLI: EVET veya HAYIR
-ACIKLAMA: <HAYIR ise hangi bilginin uyuşmadığını yaz, EVET ise boş bırak>
-"""
+SADECE şu JSON nesnesini döndür, başka hiçbir metin yazma:
+{{
+  "yetkinlikler": ["havuzdan eşleşen yetkinlikler"],
+  "tutarli": true,
+  "aciklama": "",
+  "profil": {{
+    "egitim": "",
+    "teknik_beceriler": [],
+    "programlama_dilleri": [],
+    "teknolojiler": [],
+    "deneyimler": [],
+    "projeler": [],
+    "ilgi_alanlari": [],
+    "sektor_deneyimi": [],
+    "seviye": "Orta"
+  }}
+}}"""
 
     for deneme in range(3):
         try:
+            client = genai.Client(api_key=key)
             response = client.models.generate_content(
-                model='gemini-3.6-flash',
+                model=GEMINI_MODEL,
                 contents=prompt
             )
+            veri = _json_ayikla(response.text)
+            if not isinstance(veri, dict):
+                raise ValueError("JSON çözümlenemedi")
 
-            sonuc = {}
-
-            for satir in response.text.strip().split("\n"):
-                if ":" in satir:
-                    anahtar, deger = satir.split(":", 1)
-                    # Yapay zekanın olası Türkçe düzeltmelerini yakalamak için Ç'yi C'ye çeviriyoruz
-                    duzeltilmis_anahtar = anahtar.strip().upper().replace("Ç", "C").replace("İ", "I")
-                    sonuc[duzeltilmis_anahtar] = deger.strip()
-
+            # Modelin havuz dışına çıkmasını engelle
             ai_yetkinlikler = [
-                y.strip()
-                for y in sonuc.get("YETKINLIKLER", "").split(",")
-                if y.strip()
+                str(y).strip() for y in (veri.get("yetkinlikler") or [])
+                if str(y).strip() in yetkinlikler
             ]
 
-            # 'HAYIR' kelimesi içinde geçiyorsa kabul et (bazen 'HAYIR.' veya boşluklu dönebilir)
-            tutarlilik_durumu = sonuc.get("TUTARLI", "").upper()
             tutarlilik_notu = ""
-
-            if "HAYIR" in tutarlilik_durumu:
-                tutarlilik_notu = sonuc.get("ACIKLAMA", "").strip()
-                # AI 'HAYIR' dediği halde açıklama boş bıraktıysa uyarı yine de görünsün
+            if veri.get("tutarli") is False:
+                tutarlilik_notu = str(veri.get("aciklama", "")).strip()
+                # AI 'tutarsız' deyip açıklama boş bıraktıysa uyarı yine de görünsün
                 if not tutarlilik_notu:
                     tutarlilik_notu = "CV'deki ad soyad / okul / bölüm bilgileri form bilgileriyle uyuşmuyor."
 
-            return ai_yetkinlikler, tutarlilik_notu
+            profil = dict(bos_profil)
+            gelen_profil = veri.get("profil") or {}
+            if isinstance(gelen_profil, dict):
+                for anahtar, varsayilan in bos_profil.items():
+                    deger = gelen_profil.get(anahtar)
+                    if isinstance(varsayilan, list):
+                        if isinstance(deger, str):
+                            deger = re.split(r";|,|\n", deger)
+                        profil[anahtar] = [
+                            str(d).strip(" -•\t") for d in (deger or []) if str(d).strip(" -•\t")
+                        ]
+                    elif deger:
+                        profil[anahtar] = str(deger).strip()
+
+            return ai_yetkinlikler, tutarlilik_notu, profil
 
         except Exception:
             if deneme < 2:
                 time.sleep(3)
                 continue
-            else:
-                return [], ""
+            return [], "", dict(bos_profil)
 
 def metin_analiz_et(hedef_metni, yetkinlikler, key):
     client = genai.Client(api_key=key)
@@ -249,7 +308,7 @@ def metin_analiz_et(hedef_metni, yetkinlikler, key):
 
     for deneme in range(3):
         try:
-            response = client.models.generate_content(model='gemini-3.6-flash', contents=prompt)
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
             return [yetenek.strip() for yetenek in response.text.split(",") if yetenek.strip()]
         except Exception:
             if deneme < 2:
@@ -258,167 +317,363 @@ def metin_analiz_et(hedef_metni, yetkinlikler, key):
             else:
                 return [] # Hata durumunda sistemi çökertmez, boş geçer
 
-def yeni_proje_onerisi_olustur(final_yetkinlikler, ad_soyad, bolum, key):
-    conn = sqlite3.connect('flo_stajyer.db')
-    mevcut_projeler_df = pd.read_sql_query(
-        "SELECT proje_adi, departman, aranan_yetkinlikler, aciklama FROM projeler", conn
-    )
-    conn.close()
+def _gemini_hata_mesaji(hata):
+    """Gemini API hatalarını kullanıcıya anlaşılır Türkçe mesaja çevirir."""
+    metin = str(hata)
+    if "UNAUTHENTICATED" in metin or "401" in metin or "API key not valid" in metin \
+            or "ACCESS_TOKEN_TYPE_UNSUPPORTED" in metin or "API_KEY_INVALID" in metin:
+        return (
+            "Gemini API anahtarı geçersiz. Sistemdeki anahtar bir API anahtarı değil "
+            "(geçici oturum jetonu olabilir). Google AI Studio'dan "
+            "(https://aistudio.google.com/app/apikey) 'AIza...' ile başlayan bir anahtar alıp "
+            ".streamlit/secrets.toml içindeki GEMINI_API_KEY değerini güncelleyin."
+        )
+    if "429" in metin or "RESOURCE_EXHAUSTED" in metin or "quota" in metin.lower():
+        return "Gemini API kullanım kotası doldu. Bir süre sonra tekrar deneyin."
+    if "404" in metin or "not found" in metin.lower() or "NOT_FOUND" in metin:
+        return (f"'{GEMINI_MODEL}' modeline erişilemiyor. Anahtarınızın bu modele erişimi "
+                "olmayabilir veya model adı değişmiş olabilir.")
+    if "PERMISSION_DENIED" in metin or "403" in metin:
+        return "Gemini API erişimi reddedildi (403). Anahtarın yetkileri kısıtlı olabilir."
+    return f"Yapay zeka servisine ulaşılamadı ({metin[:200]})."
 
-    ornekler = "\n".join(
-        f"- {row['proje_adi']} ({row['departman']}): {row['aciklama']} [Gerekli yetkinlikler: {row['aranan_yetkinlikler']}]"
-        for _, row in mevcut_projeler_df.iterrows()
+
+def _json_ayikla(ham_metin):
+    """Model cevabından JSON nesnesi/dizisi çıkarır (```json çitlerini temizler)."""
+    metin = (ham_metin or "").strip()
+    metin = re.sub(r"^```(?:json)?|```$", "", metin, flags=re.MULTILINE).strip()
+
+    # Önce metnin tamamını çözmeyi dene: dizi/nesne yapısı olduğu gibi korunur.
+    try:
+        return json.loads(metin)
+    except ValueError:
+        pass
+
+    # Olmazsa metnin içine gömülü ilk dizi ya da nesneyi yakala.
+    for desen in (r"\[.*\]", r"\{.*\}"):
+        eslesme = re.search(desen, metin, flags=re.DOTALL)
+        if eslesme:
+            try:
+                return json.loads(eslesme.group(0))
+            except ValueError:
+                continue
+    return None
+
+
+def _benzer_mi(metin_a, metin_b, esik=0.72):
+    """İki proje adının/açıklamasının birbirinin kopyası sayılıp sayılmayacağını ölçer."""
+    a = _sadelestir(metin_a).strip()
+    b = _sadelestir(metin_b).strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return difflib.SequenceMatcher(None, a, b).ratio() >= esik
+
+
+def _projeyi_normalize_et(ham_proje, aday_anahtar_kelimeleri):
+    """AI'dan gelen tek bir proje sözlüğünü doğrular ve standart yapıya çevirir.
+    Geçersiz ya da CV ile alakasızsa None döner."""
+    if not isinstance(ham_proje, dict):
+        return None
+
+    def _metin(anahtar, varsayilan=""):
+        return str(ham_proje.get(anahtar, varsayilan) or "").strip()
+
+    def _liste(anahtar):
+        deger = ham_proje.get(anahtar) or []
+        if isinstance(deger, str):
+            deger = re.split(r";|\n|,", deger)
+        return [str(d).strip(" -•\t") for d in deger if str(d).strip(" -•\t")]
+
+    proje_adi = _metin("proje_adi")
+    aciklama = _metin("aciklama")
+    if not proje_adi or not aciklama:
+        return None
+
+    # Departman FLO'nun gerçek organizasyon şemasında olmalı; uydurma isim kabul edilmez.
+    departman = _metin("departman")
+    if departman not in FLO_DEPARTMANLARI:
+        eslesen = [d for d in FLO_DEPARTMANLARI if _sadelestir(d) == _sadelestir(departman)]
+        departman = eslesen[0] if eslesen else "Belirtilmedi (İK ile görüşülmeli)"
+
+    zorluk = _metin("zorluk_seviyesi", "Orta")
+    if zorluk not in ("Başlangıç", "Orta", "İleri"):
+        zorluk = "Orta"
+
+    try:
+        uyum_puani = round(float(ham_proje.get("uyum_puani", 0)), 2)
+    except (TypeError, ValueError):
+        uyum_puani = 0.0
+    uyum_puani = max(0.0, min(100.0, uyum_puani))
+
+    teknolojiler = _liste("teknolojiler")
+    kazanilacak = _liste("kazanilacak_beceriler")
+    kapsam = _liste("kapsam")
+
+    # ALAKA KONTROLÜ: proje, adayın CV'sinden gelen en az bir anahtar kelimeye
+    # (yetkinlik / dil / teknoloji) dokunmalı. Aksi halde "genel proje" sayılıp elenir.
+    proje_metni = _sadelestir(" ".join(
+        [proje_adi, aciklama, _metin("amac"), _metin("uygunluk_gerekcesi")]
+        + teknolojiler + kazanilacak + kapsam
+    ))
+    alakali = any(
+        anahtar and _sadelestir(anahtar) in proje_metni
+        for anahtar in aday_anahtar_kelimeleri
+    )
+    if not alakali:
+        return None
+
+    return {
+        "proje_adi": proje_adi,
+        "departman": departman,
+        "aciklama": aciklama,
+        "amac": _metin("amac"),
+        "uygunluk_gerekcesi": _metin("uygunluk_gerekcesi"),
+        "teknolojiler": teknolojiler,
+        "zorluk_seviyesi": zorluk,
+        "kapsam": kapsam,
+        "kazanilacak_beceriler": kazanilacak,
+        "uyum_puani": uyum_puani,
+    }
+
+
+MAKSIMUM_PROJE_SAYISI = 3
+
+
+def cv_ye_ozel_projeler_uret(cv_profili, final_yetkinlikler, ad_soyad, bolum,
+                             egitim_seviyesi, sinif, staj_gunu, hedef_metni, key):
+    """Adayın CV'sine özel, SIFIRDAN 1-3 proje fikri üretir.
+
+    Hazır proje havuzu KULLANILMAZ; her öneri bu adayın profilinden türetilir.
+    Dönüş: (projeler_listesi, hata_mesaji)
+    """
+    profil = cv_profili or {}
+    diller = profil.get("programlama_dilleri", [])
+    teknolojiler = profil.get("teknolojiler", [])
+    teknik = profil.get("teknik_beceriler", [])
+    deneyimler = profil.get("deneyimler", [])
+    cv_projeleri = profil.get("projeler", [])
+    ilgi = profil.get("ilgi_alanlari", [])
+    sektor = profil.get("sektor_deneyimi", [])
+    seviye = profil.get("seviye") or "Orta"
+
+    # Alaka kontrolünde kullanılacak anahtar kelimeler
+    aday_anahtar_kelimeleri = [
+        k for k in (list(final_yetkinlikler) + diller + teknolojiler + teknik + ilgi + sektor)
+        if len(str(k).strip()) >= 3
+    ]
+    if not aday_anahtar_kelimeleri and bolum and bolum != "-":
+        aday_anahtar_kelimeleri = [bolum]
+
+    hafta_sayisi = max(1, round(int(staj_gunu) / 7)) if staj_gunu else 4
+
+    def _satir(baslik, deger):
+        if isinstance(deger, list):
+            deger = ", ".join(str(d) for d in deger)
+        deger = str(deger or "").strip()
+        return f"- {baslik}: {deger}\n" if deger else ""
+
+    aday_ozeti = (
+        _satir("Ad Soyad", ad_soyad)
+        + _satir("Eğitim durumu", f"{egitim_seviyesi} / {sinif}")
+        + _satir("Bölüm", bolum)
+        + _satir("CV'den eğitim bilgisi", profil.get("egitim"))
+        + _satir("Programlama dilleri", diller)
+        + _satir("Teknolojiler / araçlar", teknolojiler)
+        + _satir("Teknik beceriler", teknik)
+        + _satir("Yetkinlikler", final_yetkinlikler)
+        + _satir("Staj/iş deneyimleri", deneyimler)
+        + _satir("CV'deki projeler", cv_projeleri)
+        + _satir("İlgi alanları", ilgi)
+        + _satir("Sektör deneyimi", sektor)
+        + _satir("Genel seviye", seviye)
+        + _satir("Adayın kendi hedef metni", (hedef_metni or "").strip()[:500])
     )
 
     departman_listesi_metni = "\n".join(f"- {d}" for d in FLO_DEPARTMANLARI)
 
-    prompt = f"""Sen FLO ayakkabı ve spor perakende şirketinde stajyer projelerini planlayan deneyimli bir İK/proje yöneticisisin.
-    Aşağıda FLO'nun mevcut stajyer proje havuzundan örnekler var, bunları sadece FLO'nun iş yapısını ve üslubunu anlamak için referans al:
-    {ornekler}
+    prompt = f"""Sen FLO ayakkabı ve spor perakende şirketinde stajyer projelerini TASARLAYAN
+deneyimli bir İK/proje yöneticisisin. Hazır bir proje listesinden seçim YAPMIYORSUN;
+bu adayın profiline özel, daha önce var olmayan proje fikirlerini SIFIRDAN tasarlıyorsun.
 
-    Şimdi yeni bir aday geldi: {ad_soyad} ({bolum} bölümü okuyor), yetkinlikleri: {', '.join(final_yetkinlikler)}.
-    Mevcut projelerin hiçbiri bu adayın yetkinlikleriyle güçlü bir şekilde eşleşmiyor.
+ADAYIN PROFİLİ:
+{aday_ozeti}Staj süresi: {staj_gunu} gün (yaklaşık {hafta_sayisi} hafta)
 
-    Bu adayın yetkinliklerine özel, gerçekçi ve FLO bünyesinde uygulanabilir YENİ bir stajyer proje fikri öner.
+GÖREV:
+Bu adaya özel EN FAZLA {MAKSIMUM_PROJE_SAYISI} adet staj projesi fikri tasarla.
 
-    ÖNEMLİ KURAL: DEPARTMAN alanına SADECE aşağıdaki FLO departman listesinden birini,
-    yazdığı gibi BİREBİR aynı şekilde yaz. Listede olmayan, kısaltılmış ya da uydurma bir
-    departman adı YAZMA:
-    {departman_listesi_metni}
+KURALLAR:
+1. Proje sayısı 1, 2 veya 3 olabilir. Sadece gerçekten güçlü ve birbirinden farklı fikirler
+   varsa 3 yaz; zorlama, doldurma proje URETME. Emin degilsen daha az proje oner.
+2. Her proje bu adayın CV'sindeki SOMUT becerilere, dillere, teknolojilere veya deneyimlere
+   doğrudan dayanmalı. "Python ile Veri Analizi Projesi" gibi genel/klişe başlıklar YASAK.
+3. Projeler birbirinden BELİRGİN ŞEKİLDE FARKLI olmalı: farklı departman, farklı problem
+   alanı, farklı çıktı türü. Aynı fikrin varyasyonlarını yazma.
+4. Projeler FLO'nun gerçek iş yapısında (perakende, e-ticaret, ayakkabı/giyim ürün yönetimi,
+   lojistik, pazarlama, mağazacılık) uygulanabilir olmalı.
+5. Proje kapsamı {staj_gunu} günlük ({hafta_sayisi} hafta) bir stajda bitirilebilir olmalı.
+6. Adayın mevcut becerilerini KULLANDIRMALI ama aynı zamanda 1-2 yeni beceri ÖĞRETMELİ.
+7. departman alanına SADECE aşağıdaki listeden BİREBİR bir değer yaz:
+{departman_listesi_metni}
+8. uyum_puani: bu projenin adayın profiline uygunluğu (0-100 arası tam sayı). Gerçekçi ol.
 
-    Cevabını TAM OLARAK şu formatta ver, başka hiçbir açıklama ekleme:
-    PROJE_ADI: <proje adı>
-    DEPARTMAN: <yukarıdaki listeden birebir bir departman adı>
-    ACIKLAMA: <1-2 cümlelik proje açıklaması>
-    GEREKCE: <adayın yetkinlikleriyle neden uyumlu olduğuna dair 1 cümle>"""
+SADECE şu JSON dizisini döndür, başka hiçbir metin yazma:
+[
+  {{
+    "proje_adi": "spesifik ve özgün proje adı",
+    "departman": "listeden birebir departman adı",
+    "aciklama": "projenin 2-3 cümlelik açıklaması",
+    "amac": "projenin FLO için amacı, 1-2 cümle",
+    "uygunluk_gerekcesi": "bu projenin neden TAM OLARAK bu CV'ye uygun olduğu; adayın CV'sindeki somut beceri/deneyimlere isim vererek açıkla",
+    "teknolojiler": ["kullanılacak teknoloji/araç/yöntem"],
+    "zorluk_seviyesi": "Başlangıç veya Orta veya İleri",
+    "kapsam": ["yapılabilecek temel özellik/aşama 1", "özellik 2", "özellik 3"],
+    "kazanilacak_beceriler": ["bu projeyle gelişecek beceri 1", "beceri 2"],
+    "uyum_puani": 85
+  }}
+]"""
 
-    try:
-        client = genai.Client(api_key=key)
-        response = client.models.generate_content(model='gemini-3.6-flash', contents=prompt)
-        sonuc = {}
-        for satir in response.text.strip().split("\n"):
-            if ":" in satir:
-                anahtar, deger = satir.split(":", 1)
-                sonuc[anahtar.strip().upper()] = deger.strip()
+    son_hata = "Yapay zeka şu anda size özel proje üretemedi."
+    for deneme in range(3):
+        try:
+            client = genai.Client(api_key=key)
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+            veri = _json_ayikla(response.text)
+            if isinstance(veri, dict):
+                veri = veri.get("projeler") or [veri]
+            if not isinstance(veri, list):
+                raise ValueError("Beklenen JSON dizisi gelmedi")
 
-        if "PROJE_ADI" not in sonuc:
-            return None
+            projeler = []
+            for ham in veri:
+                proje = _projeyi_normalize_et(ham, aday_anahtar_kelimeleri)
+                if not proje:
+                    continue
+                # Birbirine çok benzeyen projeleri ele
+                if any(
+                    _benzer_mi(proje["proje_adi"], mevcut["proje_adi"])
+                    or _benzer_mi(proje["aciklama"], mevcut["aciklama"], esik=0.80)
+                    for mevcut in projeler
+                ):
+                    continue
+                projeler.append(proje)
+                # KOD SEVİYESİNDE ÜST SINIR
+                if len(projeler) >= MAKSIMUM_PROJE_SAYISI:
+                    break
 
-        # Güvenlik kontrolü: AI listede olmayan/uydurma bir departman yazmışsa
-        # bunu FLO'nun gerçek departmanlarından biriyle değiştirmiyoruz, sadece
-        # olduğunu belirtip en yakın bilinen değeri "Belirtilmedi" yapıyoruz.
-        if sonuc.get("DEPARTMAN") not in FLO_DEPARTMANLARI:
-            sonuc["DEPARTMAN"] = "Belirtilmedi (İK ile görüşülmeli)"
+            if projeler:
+                projeler.sort(key=lambda p: p["uyum_puani"], reverse=True)
+                return projeler[:MAKSIMUM_PROJE_SAYISI], ""
 
-        return sonuc
-    except Exception:
-        return None
+            son_hata = ("Yapay zeka üretilen proje fikirlerini CV'nizle yeterince ilişkili bulmadı. "
+                        "Daha ayrıntılı bir CV yükleyip ya da hedeflerinizi yazıp tekrar deneyin.")
+        except Exception as hata:
+            son_hata = _gemini_hata_mesaji(hata)
+            # Kimlik doğrulama / erişim hatalarında tekrar denemek anlamsız
+            if any(k in str(hata) for k in ("UNAUTHENTICATED", "401", "403",
+                                            "PERMISSION_DENIED", "API_KEY_INVALID")):
+                return [], son_hata
 
-def proje_secim_gerekcesi_olustur(en_iyi_satir, aday_yetkinlikler, ad_soyad, bolum,
-                                  sonuclar_df=None, staj_gunu=None, key=None):
-    """Seçilen projenin neden bu adaya atandığını DETAYLI biçimde açıklayan bir metin üretir.
+        if deneme < 2:
+            time.sleep(2)
 
-    Önce deterministik bir analiz (eşleşen/eksik yetkinlikler, uyum puanı) hazırlanır;
-    API anahtarı varsa yapay zeka bunu akıcı, kişiselleştirilmiş bir gerekçeye dönüştürür.
-    """
-    aranan_listesi = [y.strip() for y in str(en_iyi_satir['aranan_yetkinlikler']).split(",") if y.strip()]
-    ortak = [y for y in aranan_listesi if y in aday_yetkinlikler]
-    eksik = [y for y in aranan_listesi if y not in aday_yetkinlikler]
-    ekstra = [y for y in aday_yetkinlikler if y not in aranan_listesi]
-    puan = en_iyi_satir['Uyum Puanı (%)']
-    proje_adi = en_iyi_satir['proje_adi']
-    departman = en_iyi_satir['departman']
-    aciklama = en_iyi_satir.get('aciklama', '') if hasattr(en_iyi_satir, 'get') else en_iyi_satir['aciklama']
+    return [], son_hata
 
-    # --- Deterministik (yapay zeka olmadan da anlamlı) taban metin ---
-    if puan >= 70:
-        puan_yorum = "çok güçlü bir eşleşme"
-    elif puan >= 40:
-        puan_yorum = "iyi düzeyde bir eşleşme"
-    else:
-        puan_yorum = "kısmi bir eşleşme (yine de en yakın seçenek)"
 
+def proje_secim_gerekcesi_olustur(secilen_proje, aday_yetkinlikler, ad_soyad, bolum,
+                                  tum_projeler=None, staj_gunu=None, cv_profili=None, key=None):
+    """Üretilen ana projenin neden bu adaya özel tasarlandığını DETAYLI açıklar."""
+    profil = cv_profili or {}
+    proje_adi = secilen_proje["proje_adi"]
+    departman = secilen_proje["departman"]
+    aciklama = secilen_proje["aciklama"]
+    teknolojiler = secilen_proje.get("teknolojiler", [])
+    kazanilacak = secilen_proje.get("kazanilacak_beceriler", [])
+    kapsam = secilen_proje.get("kapsam", [])
+    puan = secilen_proje.get("uyum_puani", 0)
+    zorluk = secilen_proje.get("zorluk_seviyesi", "Orta")
+
+    aday_havuzu = set(
+        list(aday_yetkinlikler)
+        + profil.get("programlama_dilleri", [])
+        + profil.get("teknolojiler", [])
+        + profil.get("teknik_beceriler", [])
+    )
+    mevcut_olanlar = [t for t in teknolojiler if t in aday_havuzu]
+    ogrenilecekler = [t for t in teknolojiler if t not in aday_havuzu]
+
+    # --- Deterministik taban metin (yapay zeka olmasa da anlamlı) ---
     taban = (
         f"**{proje_adi}** — *{departman}*\n\n"
-        f"**Genel değerlendirme:** Bu proje, sistemdeki tüm projeler arasında profilinizle "
-        f"**%{puan}** uyum puanı alarak {puan_yorum} gösterdi. Uyum puanı, projenin aradığı "
-        f"{len(aranan_listesi)} yetkinlikten kaçının sizde bulunduğuna göre hesaplanır.\n\n"
-        f"**Sizi bu projeye uygun kılan yetkinlikler ({len(ortak)}/{len(aranan_listesi)}):** "
-        f"{', '.join(ortak) if ortak else 'doğrudan eşleşen yok, ancak genel profiliniz en yakın bu projeye düşüyor'}.\n\n"
+        f"**Bu proje sizin için sıfırdan tasarlandı.** Hazır bir proje havuzundan seçilmedi; "
+        f"CV'nizdeki eğitim bilgisi, teknik beceriler, deneyimler ve ilgi alanları okunarak "
+        f"size özel üretildi. Profil uygunluğu: **%{puan}**, zorluk seviyesi: **{zorluk}**.\n\n"
+        f"**Neden bu proje size uygun:** {secilen_proje.get('uygunluk_gerekcesi') or aciklama}\n\n"
     )
-    if eksik:
+    if secilen_proje.get("amac"):
+        taban += f"**Projenin amacı:** {secilen_proje['amac']}\n\n"
+    if mevcut_olanlar:
         taban += (
-            f"**Staj sürecinde geliştirebileceğiniz yönler:** {', '.join(eksik)}. "
-            f"Bu yetkinlikler projenin kapsamında yer alıyor; ekip ve mentor desteğiyle bunları "
-            f"uygulamalı olarak öğrenmeniz bekleniyor.\n\n"
+            f"**Hâlihazırda kullanabileceğiniz birikim:** {', '.join(mevcut_olanlar)}. "
+            f"Bu proje bu birikimi ilk günden üretime dönüştürmenizi sağlıyor.\n\n"
         )
-
-    # --- Aynı puanlı projeler arasında neden BU proje 1. sırada? ---
-    if sonuclar_df is not None and "Uyum Puanı (%)" in sonuclar_df.columns:
-        ayni_puanlilar = sonuclar_df[sonuclar_df["Uyum Puanı (%)"] == puan]
-        if len(ayni_puanlilar) > 1:
-            digerleri = [
-                p for p in ayni_puanlilar["proje_adi"].tolist() if p != proje_adi
-            ][:5]
-            es_sayi = int(en_iyi_satir.get("Eşleşen Yetkinlik Sayısı", len(ortak))) \
-                if hasattr(en_iyi_satir, "get") else len(ortak)
-            taban += (
-                f"**Neden aynı puanlı projeler arasından bu proje 1. sırada?** "
-                f"Bu projeyle birlikte toplam **{len(ayni_puanlilar)} proje** aynı **%{puan}** uyum "
-                f"puanını aldı (ör. {', '.join(digerleri)}). Eşitlik durumunda sistem şu sıraya göre "
-                f"öne çıkarır: (1) yüzde aynıysa **mutlak eşleşen yetkinlik sayısı** daha fazla olan "
-                f"(bu projede {es_sayi} yetkinlik doğrudan örtüşüyor), (2) sonra **staj sürenize "
-                f"({staj_gunu} gün) en uygun** minimum süreli proje. Bu projenin gereksinimleri "
-                f"bu iki ölçütte diğerlerine göre profilinize daha yakın düştüğü için ilk sıraya "
-                f"kondu. Diğer aynı puanlı projeler de sizin için uygun alternatiflerdir; tablodan "
-                f"inceleyebilirsiniz.\n\n"
-            )
-    if ekstra:
+    if ogrenilecekler:
         taban += (
-            f"**Projeye katabileceğiniz ek değer:** {', '.join(ekstra[:8])} gibi yetkinlikleriniz "
-            f"projenin doğrudan gereksinimi olmasa da çıktının kalitesini artırabilir.\n\n"
+            f"**Staj boyunca yeni öğrenecekleriniz:** {', '.join(ogrenilecekler)}. "
+            f"Bunlar mentor desteğiyle uygulamalı olarak kazandırılacak.\n\n"
+        )
+    if kazanilacak:
+        taban += f"**Bu projeyle gelişecek beceriler:** {', '.join(kazanilacak)}.\n\n"
+    if tum_projeler and len(tum_projeler) > 1:
+        digerleri = [p["proje_adi"] for p in tum_projeler if p["proje_adi"] != proje_adi]
+        taban += (
+            f"**Neden diğer önerilerden önce bu?** Size özel toplam {len(tum_projeler)} proje "
+            f"üretildi ({', '.join(digerleri)}). Bu proje profil uygunluğu en yüksek olan "
+            f"(%{puan}) öneri olduğu için ana öneri olarak sunuldu; diğerleri de sizin için "
+            f"tasarlanmış geçerli alternatiflerdir.\n\n"
         )
     taban += f"**Proje kapsamı:** {aciklama}"
 
     if not key:
         return taban
 
-    esitlik_bilgisi = "Bu puanı alan tek proje bu."
-    if sonuclar_df is not None and "Uyum Puanı (%)" in sonuclar_df.columns:
-        ayni = sonuclar_df[sonuclar_df["Uyum Puanı (%)"] == puan]
-        if len(ayni) > 1:
-            esitlik_bilgisi = (
-                f"Aynı %{puan} puanı {len(ayni)} proje aldı. Bu proje 1. sıraya kondu çünkü eşitlikte "
-                f"önce mutlak eşleşen yetkinlik sayısı ({len(ortak)}), sonra adayın staj süresine "
-                f"({staj_gunu} gün) uygunluk dikkate alınıyor ve bu proje bu ölçütlerde önde."
-            )
-
-    prompt = f"""Sen FLO'da stajyer yerleştirmesi yapan bir İK uzmanısın. Aşağıdaki eşleştirme sonucunu,
-adaya hitap eden, açık ve motive edici bir "Bu proje neden size atandı?" açıklamasına dönüştür.
+    prompt = f"""Sen FLO'da stajyer yerleştirmesi yapan bir İK uzmanısın. Aşağıdaki proje, bu adayın
+CV'sine özel olarak SIFIRDAN tasarlandı (hazır bir havuzdan seçilmedi). Bunu adaya hitap eden,
+açık ve motive edici bir "Bu proje neden size özel tasarlandı?" açıklamasına dönüştür.
 
 Aday: {ad_soyad} ({bolum})
-Adayın yetkinlikleri: {', '.join(aday_yetkinlikler)}
-Seçilen proje: {proje_adi} ({departman})
-Proje açıklaması: {aciklama}
-Projenin aradığı yetkinlikler: {', '.join(aranan_listesi)}
-Adayda bulunan eşleşen yetkinlikler: {', '.join(ortak) if ortak else 'yok'}
-Adayda eksik olan yetkinlikler: {', '.join(eksik) if eksik else 'yok'}
-Uyum puanı: %{puan}
-Eşitlik/sıralama durumu: {esitlik_bilgisi}
+Adayın yetkinlikleri: {', '.join(aday_yetkinlikler) or 'belirtilmemiş'}
+CV'den programlama dilleri: {', '.join(profil.get('programlama_dilleri', [])) or 'yok'}
+CV'den teknolojiler: {', '.join(profil.get('teknolojiler', [])) or 'yok'}
+CV'den deneyimler: {', '.join(profil.get('deneyimler', [])) or 'yok'}
+Adayın seviyesi: {profil.get('seviye') or 'Orta'}
+Staj süresi: {staj_gunu} gün
 
-Açıklama şu 5 başlığı içersin (markdown ** ile kalın başlıklar kullan, her başlık 2-3 cümle):
-1. **Neden bu proje?** — genel uyum ve puanın anlamı
-2. **Hangi yetkinlikleriniz işe yarayacak?** — eşleşen yetkinlikleri projedeki somut görevlerle ilişkilendir
-3. **Bu stajda ne öğreneceksiniz?** — eksik yetkinlikler ve projenin kazandıracakları
-4. **Neden diğer aynı puanlı projeler değil de bu?** — yukarıdaki eşitlik/sıralama durumunu sade bir dille açıkla (eşitlik yoksa bu başlıkta puanın neden en yüksek olduğunu söyle)
-5. **Beklentiler** — stajın sonunda ortaya çıkması beklenen çıktı
+Tasarlanan proje: {proje_adi} ({departman})
+Açıklama: {aciklama}
+Amaç: {secilen_proje.get('amac', '')}
+Uygunluk gerekçesi: {secilen_proje.get('uygunluk_gerekcesi', '')}
+Kullanılacak teknolojiler: {', '.join(teknolojiler) or 'belirtilmemiş'}
+Zorluk seviyesi: {zorluk}
+Kapsam: {'; '.join(kapsam) or 'belirtilmemiş'}
+Kazandıracağı beceriler: {', '.join(kazanilacak) or 'belirtilmemiş'}
+Profil uygunluğu: %{puan}
+Üretilen toplam alternatif sayısı: {len(tum_projeler) if tum_projeler else 1}
 
-Toplam 200-300 kelime. Uydurma bilgi ekleme, sadece verilenleri yorumla."""
+Açıklama şu 5 başlığı içersin (markdown ** ile kalın başlıklar, her başlık 2-3 cümle):
+1. **Neden bu proje size özel tasarlandı?** — CV'nizdeki hangi somut bilgilerden yola çıkıldı
+2. **Hangi becerileriniz işe yarayacak?** — mevcut becerileri projedeki somut görevlerle eşleştir
+3. **Bu stajda ne öğreneceksiniz?** — yeni teknolojiler ve kazanılacak beceriler
+4. **Zorluk ve kapsam** — seviyenize göre neden bu ölçekte tasarlandığı
+5. **Beklentiler** — stajın sonunda ortaya çıkması beklenen somut çıktı
+
+Toplam 220-320 kelime. Uydurma bilgi ekleme, sadece verilenleri yorumla."""
 
     for _ in range(2):
         try:
             client = genai.Client(api_key=key)
-            response = client.models.generate_content(model='gemini-3.6-flash', contents=prompt)
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
             metin = response.text.strip()
             if len(metin) > 120:
                 return metin
@@ -426,48 +681,6 @@ Toplam 200-300 kelime. Uydurma bilgi ekleme, sadece verilenleri yorumla."""
             pass
     return taban
 
-
-def projeleri_eslestir(aday_yetkinlikler_listesi, staj_gunu=None):
-    conn = sqlite3.connect('flo_stajyer.db')
-    df = pd.read_sql_query("SELECT * FROM projeler", conn)
-    conn.close()
-
-    uyum_puanlari = []
-    eslesen_sayilari = []
-
-    for index, row in df.iterrows():
-        aranan_metin = row["aranan_yetkinlikler"]
-        aranan_listesi = [y.strip() for y in str(aranan_metin).split(",") if y.strip()]
-        aranan_sayisi = len(aranan_listesi)
-
-        if aranan_sayisi == 0:
-            uyum_puanlari.append(0)
-            eslesen_sayilari.append(0)
-            continue
-
-        ortak_yetkinlikler = set(aranan_listesi).intersection(set(aday_yetkinlikler_listesi))
-        uyum_yuzdesi = (len(ortak_yetkinlikler) / aranan_sayisi) * 100
-
-        uyum_puanlari.append(round(uyum_yuzdesi, 2))
-        eslesen_sayilari.append(len(ortak_yetkinlikler))
-
-    df["Uyum Puanı (%)"] = uyum_puanlari
-    df["Eşleşen Yetkinlik Sayısı"] = eslesen_sayilari
-
-    # Aynı uyum puanına sahip projeler için mantıklı bir sıralama önceliği:
-    # 1) Uyum puanı yüksek olan
-    # 2) Mutlak eşleşen yetkinlik sayısı fazla olan (yüzde aynı olsa da daha çok yetkinlik örtüşüyorsa öne)
-    # 3) Adayın staj süresine en uygun (min_staj_gunu'ye yakın / altında) proje
-    if staj_gunu is not None and "min_staj_gunu" in df.columns:
-        df["_staj_uygunluk"] = (df["min_staj_gunu"].fillna(0) - float(staj_gunu)).abs()
-    else:
-        df["_staj_uygunluk"] = df.get("min_staj_gunu", 0)
-
-    df_sonuc = df.sort_values(
-        by=["Uyum Puanı (%)", "Eşleşen Yetkinlik Sayısı", "_staj_uygunluk"],
-        ascending=[False, False, True]
-    ).drop(columns="_staj_uygunluk").reset_index(drop=True)
-    return df_sonuc
 
 st.subheader("👤 Kişisel ve Eğitim Bilgileriniz")
 
@@ -564,11 +777,12 @@ if submit_button:
             st.stop()
 
         cv_tutarlilik_notu = ""
+        cv_profili = {}
 
         if yuklenen_cv:
             with st.spinner('Yapay zeka CV\'nizi okuyup form bilgilerinizle karşılaştırıyor...'):
                 cv_metni = pdf_metin_cikar(yuklenen_cv)
-                ai_yetkinlikler, cv_tutarlilik_notu = cv_analiz_ve_dogrulama_yap(
+                ai_yetkinlikler, cv_tutarlilik_notu, cv_profili = cv_analiz_ve_dogrulama_yap(
                     cv_metni, yetkinlik_havuzu, ad_soyad, nihai_bolum, nihai_universite, sinif, api_key
                 )
 
@@ -603,104 +817,169 @@ if submit_button:
                 "Başvurunuz kaydedildi ancak İK ekibi tarafından ayrıca incelenecektir."
             )
 
-        if final_yetkinlikler:
+        # --- CV'ye ÖZEL PROJE ÜRETİMİ (hazır proje havuzu kullanılmaz) ---
+        if not api_key:
+            st.error(
+                "Size özel proje üretebilmek için sol menüden Gemini API anahtarını girmelisiniz. "
+                "Projeler artık hazır bir listeden seçilmiyor, yapay zeka tarafından üretiliyor."
+            )
+            st.stop()
+
+        with st.spinner('Yapay zeka CV\'nize özel proje fikirleri tasarlıyor...'):
+            uretilen_projeler, uretim_hatasi = cv_ye_ozel_projeler_uret(
+                cv_profili, final_yetkinlikler, ad_soyad, nihai_bolum,
+                egitim_seviyesi, sinif, staj_gunu, hedef_metni, api_key
+            )
+
+        if not uretilen_projeler:
+            st.warning(
+                f"⚠️ {uretim_hatasi}\n\n"
+                "İpucu: CV'nizde teknik becerileriniz, kullandığınız teknolojiler ve "
+                "deneyimleriniz ne kadar açık yazılırsa öneriler o kadar isabetli olur."
+            )
+        else:
             st.snow()
-            sonuclar_df = projeleri_eslestir(final_yetkinlikler, staj_gunu=staj_gunu)
+            ana_proje = uretilen_projeler[0]
 
-            if sonuclar_df.empty:
-                st.warning("Seçtiğiniz yetkinliklere uygun bir proje bulunamadı.")
-            else:
-                # Hata olsa bile projeleri listelemeye kaldığı yerden devam et
-                bilgi_etiketi = lise_adi_nihai if egitim_seviyesi == "Lise" else nihai_bolum
-                st.success(f"**{ad_soyad}** ({bilgi_etiketi}) için en uygun projeler:")
-                st.dataframe(sonuclar_df, width="stretch")
+            bilgi_etiketi = lise_adi_nihai if egitim_seviyesi == "Lise" else nihai_bolum
+            st.success(
+                f"**{ad_soyad}** ({bilgi_etiketi}) için yapay zeka tarafından sıfırdan tasarlanan "
+                f"{len(uretilen_projeler)} proje önerisi:"
+            )
 
-                # 3. Başvuruyu veritabanına kaydet (Hata veren silinmiş kısım eklendi)
-                en_iyi_satir = sonuclar_df.iloc[0]
-                basvuru_kaydet(
-                    ad_soyad, egitim_seviyesi, sinif, nihai_bolum, final_yetkinlikler, staj_gunu,
-                    en_iyi_satir['departman'], en_iyi_satir['proje_adi'], en_iyi_satir['Uyum Puanı (%)'],
-                    eposta=eposta, telefon=telefon, cv_tutarlilik_notu=cv_tutarlilik_notu,
-                    lise_adi=lise_adi_nihai
-                )
-                st.toast(f"{ad_soyad} için başvuru geçmişe kaydedildi!", icon='📝')
-
-                # 4. Seçilen projenin NEDEN seçildiğini DETAYLI açıklayan bilgilendirme notu
-                with st.spinner('Bu projenin neden seçildiği değerlendiriliyor...'):
-                    secim_gerekcesi = proje_secim_gerekcesi_olustur(
-                        en_iyi_satir, final_yetkinlikler, ad_soyad, nihai_bolum,
-                        sonuclar_df=sonuclar_df, staj_gunu=staj_gunu, key=api_key or None
+            # 1) Üretilen projeleri kart olarak göster
+            ZORLUK_RENKLERI = {"Başlangıç": "🟢", "Orta": "🟡", "İleri": "🔴"}
+            for sira, proje in enumerate(uretilen_projeler, start=1):
+                etiket = "⭐ Ana Öneri" if sira == 1 else f"Alternatif {sira - 1}"
+                with st.container(border=True):
+                    st.markdown(
+                        f"#### {etiket} — {proje['proje_adi']}\n"
+                        f"*{proje['departman']}*"
                     )
-                st.info(f"ℹ️ **Bu proje neden seçildi?**\n\n{secim_gerekcesi}")
+                    ust1, ust2 = st.columns(2)
+                    ust1.metric("Profil Uygunluğu", f"%{proje['uyum_puani']:g}")
+                    ust2.metric(
+                        "Zorluk Seviyesi",
+                        f"{ZORLUK_RENKLERI.get(proje['zorluk_seviyesi'], '⚪')} {proje['zorluk_seviyesi']}"
+                    )
 
-                # 5. Stajyere seçilen proje + tarihli haftalık çalışma programını e-posta ile gönder
-                if smtp_ayarlari and api_key:
-                    with st.spinner('Yapay zeka size özel haftalık çalışma programı hazırlıyor ve e-posta gönderiyor...'):
-                        program, program_kaynak = haftalik_program_olustur(
-                            en_iyi_satir['proje_adi'], en_iyi_satir['departman'],
-                            en_iyi_satir['aciklama'], final_yetkinlikler, staj_gunu, api_key
-                        )
-                        gonderildi, eposta_mesaji = staj_programi_eposta_gonder(
-                            eposta, ad_soyad, en_iyi_satir['proje_adi'], en_iyi_satir['departman'],
-                            en_iyi_satir['aciklama'],
-                            secim_gerekcesi.replace("**", "").replace("*", ""),
-                            program, smtp_ayarlari
-                        )
-                    if gonderildi:
-                        st.success(f"📧 {eposta_mesaji}")
-                        if program_kaynak == "varsayilan":
-                            st.caption("ℹ️ Yapay zeka programı üretilemediği için genel bir şablon kullanıldı.")
-                        with st.expander("Gönderilen haftalık çalışma programını görüntüle"):
-                            for h in program:
-                                st.markdown(
-                                    f"**{h['hafta']}. Hafta** "
-                                    f"({h['baslangic'].strftime('%d.%m.%Y')} - {h['bitis'].strftime('%d.%m.%Y')}) "
-                                    f"— {h['baslik']}"
-                                )
-                                for g in h['gorevler']:
-                                    st.markdown(f"- {g}")
-                    else:
-                        st.warning(f"📧 {eposta_mesaji}")
-                elif not smtp_ayarlari:
-                    st.caption("ℹ️ Çalışma programı e-postası gönderilemedi: sistemde SMTP ayarları tanımlı değil.")
+                    st.markdown(f"**📄 Açıklama:** {proje['aciklama']}")
+                    if proje.get("amac"):
+                        st.markdown(f"**🎯 Amaç:** {proje['amac']}")
+                    if proje.get("uygunluk_gerekcesi"):
+                        st.markdown(f"**🧩 Neden bu CV'ye uygun:** {proje['uygunluk_gerekcesi']}")
+                    if proje.get("teknolojiler"):
+                        st.markdown(f"**🛠️ Kullanılacak teknolojiler:** {', '.join(proje['teknolojiler'])}")
 
-                DUSUK_ESLESME_ESIGI = 40  # yüzde
-                if en_iyi_satir['Uyum Puanı (%)'] < DUSUK_ESLESME_ESIGI and api_key:
-                    with st.spinner('Yapay zeka size özel bir proje fikri düşünüyor...'):
-                        yeni_proje = yeni_proje_onerisi_olustur(final_yetkinlikler, ad_soyad, nihai_bolum, api_key)
-                    if yeni_proje:
-                        st.info(
-                            f"🤖 **Yapay Zeka Önerisi:** Mevcut projeler arasında güçlü bir eşleşme bulunamadı, "
-                            f"işte size özel bir fikir:\n\n"
-                            f"**{yeni_proje.get('PROJE_ADI', '')}** — *{yeni_proje.get('DEPARTMAN', '')}*\n\n"
-                            f"{yeni_proje.get('ACIKLAMA', '')}\n\n"
-                            f"*Neden uygun:* {yeni_proje.get('GEREKCE', '')}"
-                        )
-            
+                    alt1, alt2 = st.columns(2)
+                    with alt1:
+                        if proje.get("kapsam"):
+                            st.markdown("**📦 Kapsam / temel özellikler:**")
+                            for madde in proje["kapsam"]:
+                                st.markdown(f"- {madde}")
+                    with alt2:
+                        if proje.get("kazanilacak_beceriler"):
+                            st.markdown("**📈 Geliştireceğiniz beceriler:**")
+                            for beceri in proje["kazanilacak_beceriler"]:
+                                st.markdown(f"- {beceri}")
+
+            # 2) Başvuruyu veritabanına kaydet.
+            # NOT: Üretilen projeler bir "proje havuzu" olarak SAKLANMIYOR. Sadece başvuru
+            # geçmişi (stajyerler tablosu) için ana önerinin adı/departmanı/puanı yazılıyor;
+            # Admin paneli bu kolonları listeliyor ve İK bu bilgi olmadan başvuruyu takip edemez.
+            basvuru_kaydet(
+                ad_soyad, egitim_seviyesi, sinif, nihai_bolum, final_yetkinlikler, staj_gunu,
+                ana_proje['departman'], ana_proje['proje_adi'], ana_proje['uyum_puani'],
+                eposta=eposta, telefon=telefon, cv_tutarlilik_notu=cv_tutarlilik_notu,
+                lise_adi=lise_adi_nihai
+            )
+            st.toast(f"{ad_soyad} için başvuru geçmişe kaydedildi!", icon='📝')
+
+            # 3) Ana projenin neden bu adaya tasarlandığını DETAYLI anlatan not
+            with st.spinner('Bu projenin neden size özel tasarlandığı açıklanıyor...'):
+                secim_gerekcesi = proje_secim_gerekcesi_olustur(
+                    ana_proje, final_yetkinlikler, ad_soyad, nihai_bolum,
+                    tum_projeler=uretilen_projeler, staj_gunu=staj_gunu,
+                    cv_profili=cv_profili, key=api_key
+                )
+            st.info(f"ℹ️ **Bu proje neden seçildi?**\n\n{secim_gerekcesi}")
+
+            # 4) Stajyere ana proje + tarihli haftalık çalışma programını e-posta ile gönder
+            if smtp_ayarlari:
+                with st.spinner('Yapay zeka size özel haftalık çalışma programı hazırlıyor ve e-posta gönderiyor...'):
+                    program, program_kaynak = haftalik_program_olustur(
+                        ana_proje['proje_adi'], ana_proje['departman'],
+                        ana_proje['aciklama'], final_yetkinlikler, staj_gunu, api_key,
+                        teknolojiler=ana_proje.get('teknolojiler')
+                    )
+                    gonderildi, eposta_mesaji = staj_programi_eposta_gonder(
+                        eposta, ad_soyad, ana_proje['proje_adi'], ana_proje['departman'],
+                        ana_proje['aciklama'],
+                        secim_gerekcesi.replace("**", "").replace("*", ""),
+                        program, smtp_ayarlari
+                    )
+                if gonderildi:
+                    st.success(f"📧 {eposta_mesaji}")
+                    if program_kaynak == "varsayilan":
+                        st.caption("ℹ️ Yapay zeka programı üretilemediği için genel bir şablon kullanıldı.")
+                    with st.expander("Gönderilen haftalık çalışma programını görüntüle"):
+                        for h in program:
+                            st.markdown(
+                                f"**{h['hafta']}. Hafta** "
+                                f"({h['baslangic'].strftime('%d.%m.%Y')} - {h['bitis'].strftime('%d.%m.%Y')}) "
+                                f"— {h['baslik']}"
+                            )
+                            for g in h['gorevler']:
+                                st.markdown(f"- {g}")
+                else:
+                    st.warning(f"📧 {eposta_mesaji}")
+            else:
+                st.caption("ℹ️ Çalışma programı e-postası gönderilemedi: sistemde SMTP ayarları tanımlı değil.")
+
+            # 5) Üretilen önerilerin özeti: tablo, grafikler ve indirilebilir rapor
+            rapor_df = pd.DataFrame([
+                {
+                    "Proje Adı": p["proje_adi"],
+                    "Departman": p["departman"],
+                    "Profil Uygunluğu (%)": p["uyum_puani"],
+                    "Zorluk": p["zorluk_seviyesi"],
+                    "Açıklama": p["aciklama"],
+                    "Amaç": p.get("amac", ""),
+                    "Neden Uygun": p.get("uygunluk_gerekcesi", ""),
+                    "Teknolojiler": ", ".join(p.get("teknolojiler", [])),
+                    "Kapsam": " | ".join(p.get("kapsam", [])),
+                    "Kazanılacak Beceriler": ", ".join(p.get("kazanilacak_beceriler", [])),
+                }
+                for p in uretilen_projeler
+            ])
+
+            with st.expander("📊 Önerilerin karşılaştırmalı özeti"):
+                st.dataframe(rapor_df, width="stretch", hide_index=True)
 
                 col1, col2 = st.columns(2)
                 with col1:
-                    # names='Departman' yerine names='departman' yazıyoruz
-                    fig_pie = px.pie(sonuclar_df, 
-                                     values='Uyum Puanı (%)', 
-                                     names='departman', 
-                                     title="Uygun Departman Dağılımı",
-                                     color_discrete_sequence=['#F25C05', '#1E1E1E', '#FF8A4C', '#D3D3D3'])
+                    fig_pie = px.pie(
+                        rapor_df, values='Profil Uygunluğu (%)', names='Departman',
+                        title="Önerilen Departman Dağılımı",
+                        color_discrete_sequence=['#F25C05', '#1E1E1E', '#FF8A4C', '#D3D3D3']
+                    )
                     st.plotly_chart(fig_pie, width="stretch", key="pie")
-                    
                 with col2:
-                    # x='Proje Adı' yerine x='proje_adi' yazıyoruz
-                    fig_bar = px.bar(sonuclar_df, x='proje_adi', y='Uyum Puanı (%)', 
-                                     title="Proje Uyum Oranları",
-                                     color_discrete_sequence=['#F25C05'])
+                    fig_bar = px.bar(
+                        rapor_df, x='Proje Adı', y='Profil Uygunluğu (%)',
+                        title="Projelerin Profil Uygunluğu",
+                        color_discrete_sequence=['#F25C05']
+                    )
                     st.plotly_chart(fig_bar, width="stretch", key="bar")
-                    
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                    sonuclar_df.to_excel(writer, index=False, sheet_name='Rapor')
-                    
-                dosya_adi = ad_soyad.replace(" ", "_")
-                st.download_button(label="📥 Bu Raporu İndir (.xlsx)", 
-                                   data=buffer.getvalue(), 
-                                   file_name=f"{dosya_adi}_rapor.xlsx", 
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                rapor_df.to_excel(writer, index=False, sheet_name='Proje Onerileri')
+
+            dosya_adi = ad_soyad.replace(" ", "_")
+            st.download_button(
+                label="📥 Bu Raporu İndir (.xlsx)",
+                data=buffer.getvalue(),
+                file_name=f"{dosya_adi}_proje_onerileri.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )

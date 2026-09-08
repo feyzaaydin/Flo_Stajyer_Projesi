@@ -8,6 +8,9 @@ from email.mime.multipart import MIMEMultipart
 
 from google import genai
 
+# Google AI Studio'da (https://aistudio.google.com/app/apikey) sunulan güncel model.
+GEMINI_MODEL = "gemini-2.5-flash"
+
 
 def _hafta_sayisi(staj_gunu):
     """Staj gününü haftaya çevirir (en az 1 hafta)."""
@@ -73,7 +76,8 @@ def _yapay_zeka_program_ayikla(ham_metin, hafta_sayisi):
     return satirlar[:hafta_sayisi]
 
 
-def haftalik_program_olustur(proje_adi, departman, proje_aciklama, yetkinlikler, staj_gunu, key):
+def haftalik_program_olustur(proje_adi, departman, proje_aciklama, yetkinlikler, staj_gunu, key,
+                             teknolojiler=None):
     """Yapay zeka ile projeye özel, haftalara bölünmüş bir çalışma programı üretir.
 
     Dönüş: (program, kaynak) — kaynak "ai" veya "varsayilan".
@@ -81,6 +85,10 @@ def haftalik_program_olustur(proje_adi, departman, proje_aciklama, yetkinlikler,
     """
     hafta_sayisi = _hafta_sayisi(staj_gunu)
     bugun = datetime.date.today()
+    teknoloji_satiri = (
+        "Projede kullanılacak teknolojiler: " + ", ".join(teknolojiler) + "\n"
+        if teknolojiler else ""
+    )
 
     prompt = f"""Sen FLO ayakkabı ve spor perakende şirketinde stajyer yöneten deneyimli bir proje yöneticisisin.
 Aşağıdaki SPESİFİK staj projesi için {hafta_sayisi} haftalık, birbirinden FARKLI ve projeye ÖZGÜ bir çalışma programı hazırla.
@@ -88,11 +96,12 @@ Aşağıdaki SPESİFİK staj projesi için {hafta_sayisi} haftalık, birbirinden
 Proje adı: {proje_adi}
 Departman: {departman}
 Proje açıklaması: {proje_aciklama}
-Stajyerin yetkinlikleri: {', '.join(yetkinlikler)}
+{teknoloji_satiri}Stajyerin yetkinlikleri: {', '.join(yetkinlikler)}
 
 KURALLAR:
 - Her haftanın başlığı ve görevleri BİRBİRİNDEN FARKLI olmalı; "haftalık hedef belirleme, görevleri yürütme, ilerleme raporu" gibi genel/tekrarlayan ifadeler KULLANMA.
-- Görevler doğrudan bu projenin açıklamasındaki işe (veri, analiz, tasarım, saha, sunum vb.) atıfta bulunsun.
+- Görevler doğrudan bu projenin açıklamasındaki işe (veri, analiz, tasarım, saha, sunum vb.) ve
+  varsa yukarıda listelenen teknolojilere atıfta bulunsun.
 - 1. hafta: oryantasyon + veri/kaynak toplama. Orta haftalar: analiz/üretim/uygulama. Son hafta: sonuç, rapor ve sunum.
 - Her hafta 3-4 somut görev.
 
@@ -105,7 +114,7 @@ SADECE şu JSON dizisini döndür, başka hiçbir metin yazma:
     for _ in range(2):
         try:
             client = genai.Client(api_key=key)
-            response = client.models.generate_content(model='gemini-3.6-flash', contents=prompt)
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
             satirlar = _yapay_zeka_program_ayikla(response.text, hafta_sayisi)
             if len(satirlar) >= max(1, hafta_sayisi - 1):
                 return _tarihlendir(satirlar, bugun), "ai"

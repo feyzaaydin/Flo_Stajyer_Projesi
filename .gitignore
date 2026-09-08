@@ -1,0 +1,19 @@
+# --- Gizli bilgiler (ASLA commit'lenmez) ---
+.streamlit/secrets.toml
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Yerel veritabanı (her kurulumda database.py ile üretilir) ---
+*.db
+
+# --- Editör / işletim sistemi ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
