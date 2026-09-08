@@ -79,7 +79,7 @@ except Exception:
     smtp_ayarlari = None
     st.sidebar.info("E-posta gönderimi kapalı: SMTP ayarları (SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD) tanımlı değil.")
 
-st.title("👟 FLO Stajyer Başvuru Sistemi")
+st.title("👟 FLO Stajyer Başvuru Sistemi -Uygulama")
 st.write("Aşağıdaki formu doldurun ve CV'nizi yükleyin.")
 
 yetkinlik_havuzu = [
